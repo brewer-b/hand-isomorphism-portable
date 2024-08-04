@@ -3,82 +3,179 @@
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include "hand_index.h"
+
+#include "deck.h"
+
+#define MAX_ROUNDS           8
+
+typedef uint64_t hand_index_t;
+typedef struct hand_indexer_s hand_indexer_t;
+typedef struct hand_indexer_state_s hand_indexer_state_t;
+
+#define PRIhand_index        PRIu64
+
+#include "hand_index-impl.h"
 
 #define MAX_GROUP_INDEX        0x100000 
 #define MAX_CARDS_PER_ROUND    15
 #define ROUND_SHIFT            4
 #define ROUND_MASK             0xf
 
-static uint8_t nth_unset[1<<RANKS][RANKS];
-static bool equal[1<<(SUITS-1)][SUITS];
-static uint_fast32_t nCr_ranks[RANKS+1][RANKS+1], rank_set_to_index[1<<RANKS], index_to_rank_set[RANKS+1][1<<RANKS], (*suit_permutations)[SUITS];
-static hand_index_t nCr_groups[MAX_GROUP_INDEX][SUITS+1];
-static void __attribute__((constructor)) hand_index_ctor() {
+struct hand_isomorphism_state {
+    uint8_t **nth_unset;
+    bool **equal;
+    uint_fast32_t **nCr_ranks;
+    uint_fast32_t *rank_set_to_index;
+    uint_fast32_t **index_to_rank_set;
+    uint_fast32_t **suit_permutations;
+    hand_index_t **nCr_groups;
+    uint_fast32_t num_permutations;
+};
+
+void hand_isomorphism_state_destroy(struct hand_isomorphism_state* state) {
+  if (state) {
+
+    for (int i = 0; i < (1 << RANKS); ++i)
+      free(state->nth_unset[i]);  
+    free(state->nth_unset);
+
+    for (int i = 0; i < (1 << (SUITS - 1)); ++i)
+      free(state->equal[i]);
+    free(state->equal);
+
+    for (int i = 0; i <= RANKS; ++i) 
+      free(state->nCr_ranks[i]);
+    free(state->nCr_ranks);
+
+    free(state->rank_set_to_index);
+
+    for (int i = 0; i <= RANKS; ++i) 
+      free(state->index_to_rank_set[i]);
+    free(state->index_to_rank_set);
+
+    for (uint_fast32_t i = 0; i < state->num_permutations; ++i)
+      free(state->suit_permutations[i]);
+    free(state->suit_permutations);
+
+    for (int i = 0; i < MAX_GROUP_INDEX; ++i) 
+      free(state->nCr_groups[i]);
+    free(state->nCr_groups);
+
+    free(state);
+  }
+}
+
+struct hand_isomorphism_state* hand_isomorphism_state_create() {
+  struct hand_isomorphism_state* state = malloc(sizeof(struct hand_isomorphism_state));
+  if (!state) return NULL;
+
+  state->num_permutations = 1;
+  for(uint_fast32_t i=2; i<=SUITS; ++i) {
+    state->num_permutations *= i;
+  }
+
+  state->nth_unset = malloc((1 << RANKS) * sizeof(uint8_t *));
+  for (int i = 0; i < (1 << RANKS); ++i)
+    state->nth_unset[i] = malloc(RANKS * sizeof(uint8_t));
+
+  state->equal = malloc((1 << (SUITS - 1)) * sizeof(bool *));
+  for (int i = 0; i < (1 << (SUITS - 1)); ++i)
+    state->equal[i] = malloc(SUITS * sizeof(bool));
+
+  state->nCr_ranks = malloc((RANKS + 1) * sizeof(uint_fast32_t *));
+  for (int i = 0; i <= RANKS; ++i)
+    state->nCr_ranks[i] = malloc((RANKS + 1) * sizeof(uint_fast32_t));
+
+  state->rank_set_to_index = malloc((1 << RANKS) * sizeof(uint_fast32_t));
+
+  state->index_to_rank_set = malloc((RANKS + 1) * sizeof(uint_fast32_t *));
+  for (int i = 0; i <= RANKS; ++i)
+    state->index_to_rank_set[i] = malloc((1 << RANKS) * sizeof(uint_fast32_t));
+
+  state->suit_permutations = malloc(state->num_permutations * sizeof(uint_fast32_t *));
+  for (uint_fast32_t i = 0; i < state->num_permutations; ++i) 
+    state->suit_permutations[i] = malloc(SUITS * sizeof(uint_fast32_t));
+
+  state->nCr_groups = malloc(MAX_GROUP_INDEX * sizeof(hand_index_t *));
+  for (int i = 0; i < MAX_GROUP_INDEX; ++i)
+    state->nCr_groups[i] = malloc((SUITS + 1) * sizeof(hand_index_t));
+
+  if (!state->nth_unset || !state->equal || !state->nCr_ranks || !state->rank_set_to_index || !state->index_to_rank_set || !state->suit_permutations || !state->nCr_groups) {
+    hand_isomorphism_state_destroy(state);
+    return NULL;
+  }
+
   for(uint_fast32_t i=0; i<1<<(SUITS-1); ++i) {
     for(uint_fast32_t j=1; j<SUITS; ++j) {
-      equal[i][j] = i&1<<(j-1);
+      state->equal[i][j] = i&1<<(j-1);
     }
   }
 
   for(uint_fast32_t i=0; i<1<<RANKS; ++i) {
     for(uint_fast32_t j=0, set=~i&(1<<RANKS)-1; j<RANKS; ++j, set&=set-1) {
-      nth_unset[i][j] = set?__builtin_ctz(set):0xff;
+      state->nth_unset[i][j] = set?__builtin_ctz(set):0xff;
     }
   }
 
-  nCr_ranks[0][0]     = 1;
+  state->nCr_ranks[0][0]     = 1;
   for(uint_fast32_t i=1; i<RANKS+1; ++i) {
-    nCr_ranks[i][0]   = nCr_ranks[i][i] = 1;
+    state->nCr_ranks[i][0]   = state->nCr_ranks[i][i] = 1;
     for(uint_fast32_t j=1; j<i; ++j) {
-      nCr_ranks[i][j] = nCr_ranks[i-1][j-1] + nCr_ranks[i-1][j];
+      state->nCr_ranks[i][j] = state->nCr_ranks[i-1][j-1] + state->nCr_ranks[i-1][j];
     }
   }
 
-  nCr_groups[0][0] = 1;
+  state->nCr_groups[0][0] = 1;
   for(uint_fast32_t i=1; i<MAX_GROUP_INDEX; ++i) {
-    nCr_groups[i][0] = 1;
+    state->nCr_groups[i][0] = 1;
     if (i < SUITS+1) {
-      nCr_groups[i][i] = 1;
+      state->nCr_groups[i][i] = 1;
     }
     for(uint_fast32_t j=1; j<(i<(SUITS+1)?i:(SUITS+1)); ++j) {
-      nCr_groups[i][j] = nCr_groups[i-1][j-1] + nCr_groups[i-1][j];
+      state->nCr_groups[i][j] = state->nCr_groups[i-1][j-1] + state->nCr_groups[i-1][j];
     } 
   }
 
   for(uint_fast32_t i=0; i<1<<RANKS; ++i) {
     for(uint_fast32_t set=i, j=1; set; ++j, set&=set-1) {
-      rank_set_to_index[i]  += nCr_ranks[__builtin_ctz(set)][j];
+      state->rank_set_to_index[i]  += state->nCr_ranks[__builtin_ctz(set)][j];
     }
-    index_to_rank_set[__builtin_popcount(i)][rank_set_to_index[i]] = i;
+    state->index_to_rank_set[__builtin_popcount(i)][state->rank_set_to_index[i]] = i;
   }
-
-  uint_fast32_t num_permutations = 1;
-  for(uint_fast32_t i=2; i<=SUITS; ++i) {
-    num_permutations *= i;
-  }
-
-  suit_permutations = calloc(num_permutations, SUITS*sizeof(uint_fast32_t));
   
-  for(uint_fast32_t i=0; i<num_permutations; ++i) {
+  for(uint_fast32_t i=0; i<state->num_permutations; ++i) {
     for(uint_fast32_t j=0, index=i, used=0; j<SUITS; ++j) {
       uint_fast32_t suit = index%(SUITS-j); index /= SUITS-j;
-      uint_fast32_t shifted_suit = nth_unset[used][suit];
-      suit_permutations[i][j] = shifted_suit;
+      uint_fast32_t shifted_suit = state->nth_unset[used][suit];
+      state->suit_permutations[i][j] = shifted_suit;
       used                   |= 1<<shifted_suit;
     }
   }
+
+  return state;
 } 
 
-void enumerate_configurations_r(uint_fast32_t rounds, const uint8_t cards_per_round[], 
+void hand_indexer_free(hand_indexer_t * indexer) {
+  for(uint_fast32_t i=0; i<indexer->rounds; ++i) {
+    free(indexer->permutation_to_configuration[i]);
+    free(indexer->permutation_to_pi[i]);
+    free(indexer->configuration_to_equal[i]);
+    free(indexer->configuration_to_offset[i]);
+    free(indexer->configuration[i]);
+    free(indexer->configuration_to_suit_size[i]);
+  }
+  //free(indexer);
+}
+
+static void enumerate_configurations_r(struct hand_isomorphism_state const* global_state, uint_fast32_t rounds, const uint8_t cards_per_round[], 
     uint_fast32_t round, uint_fast32_t remaining, 
     uint_fast32_t suit, uint_fast32_t equal, uint_fast32_t used[], uint_fast32_t configuration[],
-    void (*observe)(uint_fast32_t, uint_fast32_t[], void*), void * data) {
+    void (*observe)(struct hand_isomorphism_state const*,uint_fast32_t, uint_fast32_t[], void*), void * data) {
   if (suit == SUITS) {
-    observe(round, configuration, data);
+    observe(global_state, round, configuration, data);
 
     if (round+1 < rounds) {
-      enumerate_configurations_r(rounds, cards_per_round, round+1, cards_per_round[round+1], 0, equal, used, configuration, observe, data);
+      enumerate_configurations_r(global_state, rounds, cards_per_round, round+1, cards_per_round[round+1], 0, equal, used, configuration, observe, data);
     }
   } else {
     uint_fast32_t min = 0;
@@ -107,24 +204,24 @@ void enumerate_configurations_r(uint_fast32_t rounds, const uint8_t cards_per_ro
 
       used[suit] = old_used+i;
       configuration[suit] = new_configuration;
-      enumerate_configurations_r(rounds, cards_per_round, round, remaining-i, suit+1, new_equal, used, configuration, observe, data);
+      enumerate_configurations_r(global_state, rounds, cards_per_round, round, remaining-i, suit+1, new_equal, used, configuration, observe, data);
       configuration[suit] = old_configuration;
       used[suit] = old_used;
     }
   }
 }
 
-void enumerate_configurations(uint_fast32_t rounds, const uint8_t cards_per_round[],
-    void (*observe)(uint_fast32_t, uint_fast32_t[], void*), void * data) {
+static void enumerate_configurations(struct hand_isomorphism_state const* global_state, uint_fast32_t rounds, const uint8_t cards_per_round[],
+    void (*observe)(struct hand_isomorphism_state const*,uint_fast32_t, uint_fast32_t[], void*), void * data) {
   uint_fast32_t used[SUITS] = {0}, configuration[SUITS] = {0};
-  enumerate_configurations_r(rounds, cards_per_round, 0, cards_per_round[0], 0, (1<<SUITS) - 2, used, configuration, observe, data);
+  enumerate_configurations_r(global_state, rounds, cards_per_round, 0, cards_per_round[0], 0, (1<<SUITS) - 2, used, configuration, observe, data);
 }
 
-void count_configurations(uint_fast32_t round, uint_fast32_t configuration[], void * data) {
+static void count_configurations(struct hand_isomorphism_state const* global_state, uint_fast32_t round, uint_fast32_t configuration[], void * data) {
   uint_fast32_t * counts = data; ++counts[round];
 }
 
-void tabulate_configurations(uint_fast32_t round, uint_fast32_t configuration[], void * data) {
+static void tabulate_configurations(struct hand_isomorphism_state const* global_state, uint_fast32_t round, uint_fast32_t configuration[], void * data) {
   hand_indexer_t * indexer = data;
 
   uint_fast32_t id = indexer->configurations[round]++;
@@ -155,7 +252,7 @@ out:;
     hand_index_t size = 1;
     for(uint_fast32_t j=0, remaining=RANKS; j<=round; ++j) {
       uint_fast32_t ranks = configuration[i]>>ROUND_SHIFT*(indexer->rounds-j-1)&ROUND_MASK;
-      size *= nCr_ranks[remaining][ranks];
+      size *= global_state->nCr_ranks[remaining][ranks];
       remaining -= ranks;
     }
     assert(size+SUITS-1 < MAX_GROUP_INDEX);
@@ -165,7 +262,7 @@ out:;
       indexer->configuration_to_suit_size[round][id][k] = size;
     }
 
-    indexer->configuration_to_offset[round][id] *= nCr_groups[size+j-i-1][j-i];
+    indexer->configuration_to_offset[round][id] *= global_state->nCr_groups[size+j-i-1][j-i];
     
     for(uint_fast32_t k=i+1; k<j; ++k) {
       equal |= 1<<k;
@@ -177,7 +274,7 @@ out:;
   indexer->configuration_to_equal[round][id] = equal>>1;
 }
 
-void enumerate_permutations_r(uint_fast32_t rounds, const uint8_t cards_per_round[], 
+static void enumerate_permutations_r(uint_fast32_t rounds, const uint8_t cards_per_round[], 
     uint_fast32_t round, uint_fast32_t remaining, 
     uint_fast32_t suit, uint_fast32_t used[], uint_fast32_t count[],
     void (*observe)(uint_fast32_t, uint_fast32_t[], void*), void * data) {
@@ -210,13 +307,13 @@ void enumerate_permutations_r(uint_fast32_t rounds, const uint8_t cards_per_roun
   }
 }
 
-void enumerate_permutations(uint_fast32_t rounds, const uint8_t cards_per_round[],
+static void enumerate_permutations(uint_fast32_t rounds, const uint8_t cards_per_round[],
     void (*observe)(uint_fast32_t, uint_fast32_t[], void*), void * data) {
   uint_fast32_t used[SUITS] = {0}, count[SUITS] = {0};
   enumerate_permutations_r(rounds, cards_per_round, 0, cards_per_round[0], 0, used, count, observe, data);
 }
 
-void count_permutations(uint_fast32_t round, uint_fast32_t count[], void * data) {
+static void count_permutations(uint_fast32_t round, uint_fast32_t count[], void * data) {
   hand_indexer_t * indexer = data;
 
   uint_fast32_t idx = 0, mult = 1;
@@ -234,7 +331,7 @@ void count_permutations(uint_fast32_t round, uint_fast32_t count[], void * data)
   }
 }
 
-void tabulate_permutations(uint_fast32_t round, uint_fast32_t count[], void * data) {
+static void tabulate_permutations(uint_fast32_t round, uint_fast32_t count[], void * data) {
   hand_indexer_t * indexer = data;
 
   uint_fast32_t idx = 0, mult = 1;
@@ -301,17 +398,21 @@ void tabulate_permutations(uint_fast32_t round, uint_fast32_t count[], void * da
   indexer->permutation_to_configuration[round][idx] = low;
 }
 
-bool hand_indexer_init(uint_fast32_t rounds, const uint8_t cards_per_round[], hand_indexer_t * indexer) {
+hand_indexer_t* hand_indexer_init(struct hand_isomorphism_state const* global_state, uint_fast32_t rounds, const uint8_t cards_per_round[]) {
+  hand_indexer_t* indexer = malloc(sizeof(*indexer));
+  if (!indexer){
+    return NULL;
+  }
   if (rounds == 0) {
-    return false;
+    return NULL;
   }
   if (rounds > MAX_ROUNDS) {
-    return false;
+    return NULL;
   }
   for(uint_fast32_t i=0, count=0; i<rounds; ++i) {
     count += cards_per_round[i];
     if (count > CARDS) {
-      return false;
+      return NULL;
     }
   }
 
@@ -324,7 +425,7 @@ bool hand_indexer_init(uint_fast32_t rounds, const uint8_t cards_per_round[], ha
   }
 
   memset(indexer->configurations, 0, sizeof(indexer->configurations));
-  enumerate_configurations(rounds, cards_per_round, count_configurations, indexer->configurations);
+  enumerate_configurations(global_state, rounds, cards_per_round, count_configurations, indexer->configurations);
 
   for(uint_fast32_t i=0; i<rounds; ++i) {
     indexer->configuration_to_equal[i]     = calloc(indexer->configurations[i], sizeof(uint_fast32_t));
@@ -336,12 +437,12 @@ bool hand_indexer_init(uint_fast32_t rounds, const uint8_t cards_per_round[], ha
         !indexer->configuration[i] ||
         !indexer->configuration_to_suit_size[i]) {
       hand_indexer_free(indexer);
-      return false; 
+      return NULL; 
     }
   }
 
   memset(indexer->configurations, 0, sizeof(indexer->configurations));
-  enumerate_configurations(rounds, cards_per_round, tabulate_configurations, indexer);
+  enumerate_configurations(global_state, rounds, cards_per_round, tabulate_configurations, indexer);
   
   for(uint_fast32_t i=0; i<rounds; ++i) {
     hand_index_t accum = 0; for(uint_fast32_t j=0; j<indexer->configurations[i]; ++j) {
@@ -358,27 +459,16 @@ bool hand_indexer_init(uint_fast32_t rounds, const uint8_t cards_per_round[], ha
   for(uint_fast32_t i=0; i<rounds; ++i) {
     indexer->permutation_to_configuration[i] = calloc(indexer->permutations[i], sizeof(uint_fast32_t));
     indexer->permutation_to_pi[i] = calloc(indexer->permutations[i], sizeof(uint_fast32_t));
-    if (!indexer->permutation_to_configuration ||
-        !indexer->permutation_to_pi) {
+    if (!indexer->permutation_to_configuration[i] ||
+        !indexer->permutation_to_pi[i]) {
       hand_indexer_free(indexer);
-      return false; 
+      return NULL; 
     }
   }
 
   enumerate_permutations(rounds, cards_per_round, tabulate_permutations, indexer);
 
-  return true;
-}
-
-void hand_indexer_free(hand_indexer_t * indexer) {
-  for(uint_fast32_t i=0; i<indexer->rounds; ++i) {
-    free(indexer->permutation_to_configuration[i]);
-    free(indexer->permutation_to_pi[i]);
-    free(indexer->configuration_to_equal[i]);
-    free(indexer->configuration_to_offset[i]);
-    free(indexer->configuration[i]);
-    free(indexer->configuration_to_suit_size[i]);
-  }
+  return indexer;
 }
 
 hand_index_t hand_indexer_size(const hand_indexer_t * indexer, uint_fast32_t round) {
@@ -386,7 +476,7 @@ hand_index_t hand_indexer_size(const hand_indexer_t * indexer, uint_fast32_t rou
   return indexer->round_size[round];
 }
 
-void hand_indexer_state_init(const hand_indexer_t * indexer, hand_indexer_state_t * state) {
+static void hand_indexer_state_init(const hand_indexer_t * indexer, hand_indexer_state_t * state) {
   memset(state, 0, sizeof(hand_indexer_state_t));
  
   state->permutation_multiplier = 1;
@@ -395,26 +485,7 @@ void hand_indexer_state_init(const hand_indexer_t * indexer, hand_indexer_state_
   }
 }
 
-hand_index_t hand_index_all(const hand_indexer_t * indexer, const uint8_t cards[], hand_index_t indices[]) {
-  if (indexer->rounds) {
-    hand_indexer_state_t state; hand_indexer_state_init(indexer, &state);
-
-    for(uint_fast32_t i=0, j=0; i<indexer->rounds; j+=indexer->cards_per_round[i++]) {
-      indices[i] = hand_index_next_round(indexer, cards+j, &state);
-    }
-
-    return indices[indexer->rounds-1];
-  }
-
-  return 0;
-}
-
-hand_index_t hand_index_last(const hand_indexer_t * indexer, const uint8_t cards[]) {
-  hand_index_t indices[MAX_ROUNDS];
-  return hand_index_all(indexer, cards, indices);
-}
-
-hand_index_t hand_index_next_round(const hand_indexer_t * indexer, const uint8_t cards[], hand_indexer_state_t * state) {
+static hand_index_t hand_index_next_round(struct hand_isomorphism_state const* global_state, const hand_indexer_t * indexer, const uint8_t cards[], hand_indexer_state_t * state) {
   uint_fast32_t round = state->round++;
   assert(round < indexer->rounds);
 
@@ -432,8 +503,8 @@ hand_index_t hand_index_next_round(const hand_indexer_t * indexer, const uint8_t
     assert(!(state->used_ranks[i]&ranks[i])); /* no duplicate cards */
 
     uint_fast32_t used_size    = __builtin_popcount(state->used_ranks[i]), this_size = __builtin_popcount(ranks[i]);
-    state->suit_index[i]      += state->suit_multiplier[i]*rank_set_to_index[shifted_ranks[i]];
-    state->suit_multiplier[i] *= nCr_ranks[RANKS-used_size][this_size];
+    state->suit_index[i]      += state->suit_multiplier[i]*global_state->rank_set_to_index[shifted_ranks[i]];
+    state->suit_multiplier[i] *= global_state->nCr_ranks[RANKS-used_size][this_size];
     state->used_ranks[i]      |= ranks[i];
   }
 
@@ -448,7 +519,7 @@ hand_index_t hand_index_next_round(const hand_indexer_t * indexer, const uint8_t
   uint_fast32_t pi_index      = indexer->permutation_to_pi[round][state->permutation_index];
   uint_fast32_t equal_index   = indexer->configuration_to_equal[round][configuration];
   hand_index_t offset         = indexer->configuration_to_offset[round][configuration];
-  const uint_fast32_t * pi    = suit_permutations[pi_index];
+  const uint_fast32_t * pi    = global_state->suit_permutations[pi_index];
 
   hand_index_t suit_index[SUITS], suit_multiplier[SUITS];
   for(uint_fast32_t i=0; i<SUITS; ++i) {
@@ -470,26 +541,26 @@ hand_index_t hand_index_next_round(const hand_indexer_t * indexer, const uint8_t
   for(uint_fast32_t i=0; i<SUITS;) {
     hand_index_t part, size;
 
-    if (i+1 < SUITS && equal[equal_index][i+1]) {
-      if (i+2 < SUITS && equal[equal_index][i+2]) {
-        if (i+3 < SUITS && equal[equal_index][i+3]) {
+    if (i+1 < SUITS && global_state->equal[equal_index][i+1]) {
+      if (i+2 < SUITS && global_state->equal[equal_index][i+2]) {
+        if (i+3 < SUITS && global_state->equal[equal_index][i+3]) {
           /* four equal suits */
           swap(i, i+1); swap(i+2, i+3); swap(i, i+2); swap(i+1, i+3); swap(i+1, i+2);
-          part = suit_index[i] + nCr_groups[suit_index[i+1]+1][2] + nCr_groups[suit_index[i+2]+2][3] + nCr_groups[suit_index[i+3]+3][4];
-          size = nCr_groups[suit_multiplier[i]+3][4];
+          part = suit_index[i] + global_state->nCr_groups[suit_index[i+1]+1][2] + global_state->nCr_groups[suit_index[i+2]+2][3] + global_state->nCr_groups[suit_index[i+3]+3][4];
+          size = global_state->nCr_groups[suit_multiplier[i]+3][4];
           i += 4;
         } else {
           /* three equal suits */
           swap(i, i+1); swap(i, i+2); swap(i+1, i+2);
-          part = suit_index[i] + nCr_groups[suit_index[i+1]+1][2] + nCr_groups[suit_index[i+2]+2][3];
-          size = nCr_groups[suit_multiplier[i]+2][3];
+          part = suit_index[i] + global_state->nCr_groups[suit_index[i+1]+1][2] + global_state->nCr_groups[suit_index[i+2]+2][3];
+          size = global_state->nCr_groups[suit_multiplier[i]+2][3];
           i += 3;
         }
       } else {
         /* two equal suits*/
         swap(i, i+1);
-        part = suit_index[i] + nCr_groups[suit_index[i+1]+1][2];
-        size = nCr_groups[suit_multiplier[i]+1][2];
+        part = suit_index[i] + global_state->nCr_groups[suit_index[i+1]+1][2];
+        size = global_state->nCr_groups[suit_multiplier[i]+1][2];
         i += 2;
       }
     } else {
@@ -508,7 +579,26 @@ hand_index_t hand_index_next_round(const hand_indexer_t * indexer, const uint8_t
   return index;
 }
 
-bool hand_unindex(const hand_indexer_t * indexer, uint_fast32_t round, hand_index_t index, uint8_t cards[]) {
+static hand_index_t hand_index_all(struct hand_isomorphism_state const* global_state, const hand_indexer_t * indexer, const uint8_t cards[], hand_index_t indices[]) {
+  if (indexer->rounds) {
+    hand_indexer_state_t state; hand_indexer_state_init(indexer, &state);
+
+    for(uint_fast32_t i=0, j=0; i<indexer->rounds; j+=indexer->cards_per_round[i++]) {
+      indices[i] = hand_index_next_round(global_state, indexer, cards+j, &state);
+    }
+
+    return indices[indexer->rounds-1];
+  }
+
+  return 0;
+}
+
+hand_index_t hand_index_last(struct hand_isomorphism_state const* global_state, const hand_indexer_t * indexer, const uint8_t cards[]) {
+  hand_index_t indices[MAX_ROUNDS];
+  return hand_index_all(global_state, indexer, cards, indices);
+}
+
+bool hand_unindex(struct hand_isomorphism_state const* global_state, const hand_indexer_t * indexer, uint_fast32_t round, hand_index_t index, uint8_t cards[]) {
   if (round >= indexer->rounds || index >= indexer->round_size[round]) {
     return false;
   }
@@ -530,7 +620,7 @@ bool hand_unindex(const hand_indexer_t * indexer, uint_fast32_t round, hand_inde
     uint_fast32_t j=i+1; for(; j<SUITS && indexer->configuration[round][configuration_idx][j] == indexer->configuration[round][configuration_idx][i]; ++j) {}
     
     uint_fast32_t suit_size  = indexer->configuration_to_suit_size[round][configuration_idx][i];
-    hand_index_t group_size  = nCr_groups[suit_size+j-i-1][j-i];
+    hand_index_t group_size  = global_state->nCr_groups[suit_size+j-i-1][j-i];
     hand_index_t group_index = index%group_size; index /= group_size;
 
     for(; i<j-1; ++i) {
@@ -543,7 +633,7 @@ bool hand_unindex(const hand_indexer_t * indexer, uint_fast32_t round, hand_inde
       }
       while(low < high) {
         uint_fast32_t mid = (low+high)/2;
-        if (nCr_groups[mid+j-i-1][j-i] <= group_index) {
+        if (global_state->nCr_groups[mid+j-i-1][j-i] <= group_index) {
           suit_index[i] = mid;
           low = mid+1;
         } else {
@@ -552,7 +642,7 @@ bool hand_unindex(const hand_indexer_t * indexer, uint_fast32_t round, hand_inde
       }
 
       //for(suit_index[i]=0; nCr_groups[suit_index[i]+1+j-i-1][j-i] <= group_index; ++suit_index[i]) {}
-      group_index -= nCr_groups[suit_index[i]+j-i-1][j-i]; 
+      group_index -= global_state->nCr_groups[suit_index[i]+j-i-1][j-i]; 
     }
 
     suit_index[i] = group_index; ++i;
@@ -563,12 +653,12 @@ bool hand_unindex(const hand_indexer_t * indexer, uint_fast32_t round, hand_inde
     uint_fast32_t used = 0, m = 0;
     for(uint_fast32_t j=0; j<indexer->rounds; ++j) {
       uint_fast32_t n              = indexer->configuration[round][configuration_idx][i]>>ROUND_SHIFT*(indexer->rounds-j-1)&ROUND_MASK;
-      uint_fast32_t round_size     = nCr_ranks[RANKS-m][n]; m += n;
+      uint_fast32_t round_size     = global_state->nCr_ranks[RANKS-m][n]; m += n;
       uint_fast32_t round_idx      = suit_index[i]%round_size; suit_index[i] /= round_size;
-      uint_fast32_t shifted_cards  = index_to_rank_set[n][round_idx], rank_set = 0;
+      uint_fast32_t shifted_cards  = global_state->index_to_rank_set[n][round_idx], rank_set = 0;
       for(uint_fast32_t k=0; k<n; ++k) {
         uint_fast32_t shifted_card = shifted_cards&-shifted_cards; shifted_cards ^= shifted_card;
-        uint_fast32_t card         = nth_unset[used][__builtin_ctz(shifted_card)]; rank_set |= 1<<card;
+        uint_fast32_t card         = global_state->nth_unset[used][__builtin_ctz(shifted_card)]; rank_set |= 1<<card;
         cards[location[j]++]       = deck_make_card(i, card);
       }
       used |= rank_set;
